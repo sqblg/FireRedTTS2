@@ -1,0 +1,30 @@
+{
+  "French": {
+    "S1":"Ferme les yeux et installe-toi confortablement.Nous allons entreprendre un voyage au cœur de notre inconscient.",
+    "S2":"Le véritable voyage de découverte consiste non pas en ce de chercher de nouveaux paysages, mais en avoir de nouveaux yeux."
+  },
+  "Japanese": {
+    "S1":"人は経験によって成長する。失敗もその一部だ。",
+    "S2":"なんて素敵なプレゼント。とっても嬉しいです。ちょうど紅茶を入れたところなの。おいしいマカロンと一緒にいただきましょう。楽しいお話をたくさんしましょうね。"
+  },
+  "Korean": {
+    "S1":"어려움은 잠시일 뿐, 포기하는 것이 영원한 실패이다.",
+    "S2":"떡볶이가 먹고 싶은 영감은 그냥 찾아와요. 내가 할 수 있는 건 자유의지라고 굳이 부르자면 떡볶이를 먹고 싶은 나를 받아들일까 말까 그게 내가 할 수 있는 유일한 것이고 내가 나를 보살피기 위한 유일한 게 그것 딱 하나라는 거를 요즘에 좀 실천하고 있습니다."
+  },
+  "German": {
+    "S1":"Ich frage mich immer mal, woher kommt die elf bei Eleven Labs? Aber das ging mir auch so bei 7-Eleven. Das beschäftigt mich wirklich.",
+    "S2":"Um etwas in dein Leben zu bringen, stelle dir vor, es ist bereits da."
+  },
+  "Russian": {
+    "S1":"Каждый думает о том, чтобы изменить мир, но никто не думает о том, чтобы изменить себя.",
+    "S2":"Будь здесь сейчас, позже где-то ещё. Это так сложно."
+  },
+  "English": {
+    "S1":"Hey, everyone, and welcome back to the show. It's great to have you with us again today. We're diving into something I've been really looking forward to. You know, sometimes you just stumble upon an idea that makes you go, huh? Why didn't I think of that sooner? That's exactly what happened here. So grab a coffee, settle in, and let's get into it.",
+    "S2":"Hey, everyone. Thanks for tuning in to today's episode. I'm really excited about what we're going to dive into. You know, it's funny how often we overlook the simple things, right? But those are usually the most impactful. I've been thinking a lot about connection lately and how we can all foster more meaningful relationships, both online and off. It's something that truly resonates with me, and I hope it does with you, too."
+  },
+  "Chinese": {
+    "S1":"啊，可能说更适合美国市场应该是什么样子。那这这个可能说当然如果说有有机会能亲身的去考察去了解一下，那当然是有更好的帮助。",
+    "S2":"哈囉，我是安娜蘇。有些計畫不是為了完成，是為了有藉口一起快樂的冒險。就算夢想超級大，也可以用弱弱的速度前進。讓我們一起改變世界。如果跌倒了，那也沒關係，就順便坐下來一起吃點東西囉。"
+  }
+}
