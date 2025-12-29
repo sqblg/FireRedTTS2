@@ -1,11 +1,17 @@
+import runpod
 import os
-import subprocess
+import sys
+import json
 import traceback
+import base64
+import shutil  # 🔵 [新增] 用于删除坏掉的文件夹
 from datetime import datetime
 import torch
 import torchaudio
-import runpod
-from fireredtts2.fireredtts2 import FireRedTTS2
+import boto3
+from botocore.client import Config
+from supabase import create_client
+from huggingface_hub import snapshot_download  # 🔵 [新增] 核心下载工具
 
 # ==================== 环境变量 ====================
 # 请在 RunPod 控制台的 Environment Variables 中设置这些值
@@ -19,11 +25,13 @@ R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "blockfm-audio")
 R2_REGION = os.environ.get("R2_REGION", "auto")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://audio.blockfm.io")
 
-# 资产路径 (对齐 Dockerfile 的 WORKDIR /app)
+# 资产路径（对应您仓库根目录的位置）
+# 默认 Docker 路径为 /app
 ASSETS_DIR = os.environ.get("ASSETS_DIR", "/app/assets")
 PROMPT_TEXTS_FILE = os.environ.get("PROMPT_TEXTS_FILE", "/app/prompt_texts.json")
 
-# 模型路径 (对齐 Dockerfile 的 ENV MODEL_DIR=/runpod-volume/FireRedTTS2)
+# 模型路径
+# 关键：必须指向 Network Volume 挂载点
 MODEL_DIR = os.environ.get("MODEL_DIR", "/runpod-volume/FireRedTTS2")
 
 LANG_ISO_TO_NAME = {
@@ -60,37 +68,62 @@ def get_r2_client():
 
 def get_tts_model():
     """
-    🔵 [关键修正] 运行时模型下载
-    如果 Network Volume 为空，自动从 HuggingFace Clone
+    惰性获取 TTS 模型 (增强版：使用 snapshot_download)
     """
     global _tts_model
     if _tts_model is None:
-        # 1. 检查 Volume 是否已有模型
-        if not os.path.exists(MODEL_DIR):
-            print(f"📥 Model not found in Volume at {MODEL_DIR}. Downloading...")
-            os.makedirs(os.path.dirname(MODEL_DIR), exist_ok=True)
-            
-            try:
-                # 使用 git-lfs 拉取大文件
-                subprocess.run(["git", "lfs", "install"], check=True, env=os.environ.copy())
-                subprocess.run([
-                    "git", "clone", 
-                    "https://huggingface.co/FireRedTeam/FireRedTTS2", 
-                    MODEL_DIR
-                ], check=True, env=os.environ.copy())
-                print(f"   ✅ Model downloaded successfully to {MODEL_DIR}")
-            except subprocess.CalledProcessError as e:
-                print(f"   ❌ Failed to download model: {e}")
-                raise
+        print(f"🚀 Checking model integrity in: {MODEL_DIR}")
         
-        # 2. 加载模型
-        print(f"🚀 Loading FireRedTTS2 model from {MODEL_DIR}...")
+        # 1. 检查关键文件是否存在 (作为下载成功的标志)
+        # FireRedTTS2 的核心权重文件
+        required_files = ["config_llm.json", "codec.pt"] 
+        is_complete = os.path.exists(MODEL_DIR) and any(
+            os.path.exists(os.path.join(MODEL_DIR, f)) for f in required_files
+        )
+
+        if not is_complete:
+            print("   📥 Model missing or incomplete. Starting intelligent download...")
+            
+            # 2. 清理残余 (解决 git exit code 128 的关键)
+            # 如果文件夹存在但文件不齐，说明上次下载断了。虽然 snapshot_download 支持断点，
+            # 但为了保险，如果发现是个空壳文件夹，直接删掉重来。
+            if os.path.exists(MODEL_DIR) and not os.listdir(MODEL_DIR):
+                 print("   🧹 Removing empty directory to prevent conflicts...")
+                 os.rmdir(MODEL_DIR)
+
+            try:
+                # 3. 使用官方 SDK 下载 (支持断点续传，不会报错文件夹已存在)
+                snapshot_download(
+                    repo_id="FireRedTeam/FireRedTTS2",
+                    local_dir=MODEL_DIR,
+                    resume_download=True,
+                    max_workers=8
+                )
+                print("   ✅ Download complete.")
+            except Exception as e:
+                print(f"   ❌ Download failed: {e}")
+                # 抛出异常让 RunPod 重启，不要继续尝试加载坏模型
+                raise e
+        else:
+            print("   📂 Model integrity check passed. Using cache.")
+
+        # 4. 加载模型
+        print(f"🔥 Loading FireRedTTS2 from {MODEL_DIR}...")
+        
+        # 确保代码库在 path 中
+        # 假设 Dockerfile 已经安装了依赖，但我们这里显式添加路径作为兜底
+        if "/app/FireRedTTS2_Code" not in sys.path:
+            sys.path.append("/app/FireRedTTS2_Code")
+            
+        from fireredtts2.fireredtts2 import FireRedTTS2
+            
         _tts_model = FireRedTTS2(
             pretrained_dir=MODEL_DIR,
             gen_type="dialogue",
             device="cuda"
         )
         print("✅ Model loaded successfully")
+        
     return _tts_model
 
 def get_cloning_refs(language_iso: str):
@@ -112,7 +145,6 @@ def get_cloning_refs(language_iso: str):
     s1_path = os.path.join(ASSETS_DIR, language_iso, "S1.mp3")
     s2_path = os.path.join(ASSETS_DIR, language_iso, "S2.mp3")
     
-    # 检查文件是否存在并处理后缀
     refined_paths = []
     for p in [s1_path, s2_path]:
         if os.path.exists(p):
@@ -145,7 +177,7 @@ def run_tts_process(episode_id: str):
     language = episode.get('language')
     script_content = episode.get('script_content', {})
     
-    # 2. 🔵 [关键] 更新状态为 'tts_processing' (咬合后端逻辑)
+    # 2. 更新状态为 'tts_processing'
     print(f"   ⏳ Updating status to 'tts_processing'...")
     supabase.table('episodes').update({'status': 'tts_processing'}).eq('id', episode_id).execute()
 
@@ -179,14 +211,20 @@ def run_tts_process(episode_id: str):
     
     audio_url = f"{R2_PUBLIC_URL.rstrip('/')}/{r2_key}"
 
-    # 6. 完成回写 (咬合后端 types.ts)
+    # 6. 完成回写
     print(f"   ✅ RAG Upload complete. Updating DB status to 'completed'...")
     supabase.table('episodes').update({
         'audio_url': audio_url,
         'duration': int(duration_seconds),
         'status': 'completed',
-        'tts_updated_at': datetime.utcnow().isoformat()
+        'tts_updated_at': datetime.utcnow().isoformat(),
+        'retry_count': 0  # 重置重试计数
     }).eq('id', episode_id).execute()
+    
+    # 清理
+    if os.path.exists(tmp_path): os.remove(tmp_path)
+    # 显存清理
+    torch.cuda.empty_cache()
 
     return {"audio_url": audio_url}
 
@@ -206,7 +244,7 @@ def handler(job):
 
         print(f"\n🔥 [RunPod] Starting TTS job for episode {episode_id}")
         
-        # 🔵 [修正] 调用同步函数
+        # 调用同步函数
         result = run_tts_process(episode_id)
         
         return {"status": "success", "output": result}
@@ -215,31 +253,24 @@ def handler(job):
         print(f"🔴 [RunPod] Error processing episode {episode_id}: {str(e)}")
         traceback.print_exc()
         
-        # 🔵 [关键修复] 显式回写数据库状态为 'failed'
-        # 原因：防止数据永久卡在 'tts_processing'，允许后端 Cron 逻辑重试
+        # 失败回写
         if episode_id:
             try:
                 supabase = get_supabase_client()
-                
-                # 获取当前的 retry_count
                 resp = supabase.table('episodes').select('retry_count').eq('id', episode_id).execute()
                 if resp.data:
                     current_retry = resp.data[0].get('retry_count', 0)
-                    
                     if current_retry < 3:
-                        # 小于 3 次，重置为 queued 并增加计数
                         supabase.table('episodes').update({
                             'status': 'queued',
                             'retry_count': current_retry + 1
                         }).eq('id', episode_id).execute()
                         print(f"   🔄 Episode {episode_id} re-queued (retry #{current_retry + 1})")
                     else:
-                        # 超过 3 次，标记为永久失败
                         supabase.table('episodes').update({
                             'status': 'failed'
                         }).eq('id', episode_id).execute()
                         print(f"   ❌ Episode {episode_id} marked as failed (max retries)")
-                        
             except Exception as db_err:
                 print(f"   ❌ Failed to update DB status: {db_err}")
         
