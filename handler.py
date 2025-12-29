@@ -179,4 +179,4 @@ def handler(job):
 
 if __name__ == "__main__":
     # 启动 RunPod Worker
-    runpod.serverless.start({"app": app})
+    runpod.serverless.start({"handler": handler})
