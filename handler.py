@@ -141,7 +141,14 @@ def get_cloning_refs(language_iso: str):
     if not texts_data:
         raise ValueError(f"Prompt texts not found for: {lang_name}")
     
-    s1_text, s2_text = texts_data.get('S1'), texts_data.get('S2')
+    s1_text = texts_data.get('S1')
+    s2_text = texts_data.get('S2')
+    
+    # 🔴 [关键修复] 添加 [S1]/[S2] 标签前缀，修复 AssertionError
+    # 你的 JSON 里是纯文本，模型要求必须带标签
+    s1_text_tagged = f"[S1]{s1_text}"
+    s2_text_tagged = f"[S2]{s2_text}"
+
     s1_path = os.path.join(ASSETS_DIR, language_iso, "S1.mp3")
     s2_path = os.path.join(ASSETS_DIR, language_iso, "S2.mp3")
     
@@ -156,7 +163,8 @@ def get_cloning_refs(language_iso: str):
             else:
                 raise FileNotFoundError(f"Missing asset: {p}")
 
-    return (refined_paths, [s1_text, s2_text])
+    # 返回带标签的文本
+    return (refined_paths, [s1_text_tagged, s2_text_tagged])
 
 # ==================== 核心处理逻辑 (同步) ====================
 
