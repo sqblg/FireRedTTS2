@@ -72,4 +72,4 @@ ENV PYTHONUNBUFFERED=1
 ENV MODEL_DIR=/models/FireRedTTS2
 
 # 启动 Worker
-CMD ["python", "-u", "handler.py"]
+CMD ["python", "-u", "app.py"]
