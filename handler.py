@@ -10,7 +10,7 @@ import runpod
 from fireredtts2.fireredtts2 import FireRedTTS2
 
 # ==================== 环境变量 ====================
-# 请在 RunPod 控制台的 Environment Variables 中设置这些值
+# 请在 RunPod 控制台的 Environment Variables 中设置以下变量
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
@@ -22,10 +22,10 @@ R2_REGION = os.environ.get("R2_REGION", "auto")
 R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "https://audio.blockfm.io")
 
 # 资产路径（对应您仓库根目录的位置）
-ASSETS_DIR = './assets'
-PROMPT_TEXTS_FILE = './prompt_texts.json'
-MODEL_DIR = "/models/FireRedTTS2" # 假设在 Dockerfile 中下载到了此位置
+ASSETS_DIR = os.environ.get("ASSETS_DIR", "./assets")
+PROMPT_TEXTS_FILE = os.environ.get("PROMPT_TEXTS_FILE", "./prompt_texts.json")
 
+# 语言映射
 LANG_ISO_TO_NAME = {
     'zh': 'Chinese', 'en': 'English', 'ja': 'Japanese',
     'ko': 'Korean', 'de': 'German', 'fr': 'French', 'ru': 'Russian'
@@ -61,13 +61,26 @@ def get_r2_client():
 def get_tts_model():
     global _tts_model
     if _tts_model is None:
-        print(f"🚀 Loading FireRedTTS2 model from {MODEL_DIR}...")
+        # 网络卷挂载路径（RunPod Serverless 固定为 /runpod-volume）
+        # 对应您创建的 firered-storge 卷
+        MODEL_PATH = "/runpod-volume/FireRedTTS2"
+        
+        # 检查关键模型文件是否存在（以 codec.pt 为例）
+        if not os.path.exists(os.path.join(MODEL_PATH, "codec.pt")):
+            print(f"🚀 首次运行：正在下载模型至持久化网络卷 {MODEL_PATH}...")
+            os.makedirs("/runpod-volume", exist_ok=True)
+            # 执行下载逻辑。由于网络卷持久化，此操作仅需执行一次
+            os.system(f"git lfs install && git clone https://huggingface.co/FireRedTeam/FireRedTTS2 {MODEL_PATH}")
+            print("✅ 模型下载完成并已存入持久化存储。")
+        else:
+            print(f"🚀 发现持久化模型，正在从网络卷热加载...")
+
         _tts_model = FireRedTTS2(
-            pretrained_dir=MODEL_DIR,
+            pretrained_dir=MODEL_PATH,
             gen_type="dialogue",
             device="cuda"
         )
-        print("✅ Model loaded successfully")
+        print("✅ 模型加载成功")
     return _tts_model
 
 def get_cloning_refs(language_iso: str):
@@ -79,22 +92,21 @@ def get_cloning_refs(language_iso: str):
         all_prompt_texts = json.load(f)
     
     texts_data = all_prompt_texts.get(lang_name)
-    if not texts_data:
-        raise ValueError(f"Prompt texts not found for: {lang_name}")
-    
     s1_text, s2_text = texts_data.get('S1'), texts_data.get('S2')
     s1_path = os.path.join(ASSETS_DIR, language_iso, "S1.mp3")
     s2_path = os.path.join(ASSETS_DIR, language_iso, "S2.mp3")
     
-    # 检查文件是否存在
+    refined_paths = []
     for p in [s1_path, s2_path]:
-        if not os.path.exists(p):
-            # 尝试替代后缀
+        if os.path.exists(p):
+            refined_paths.append(p)
+        else:
             alt_p = p.replace(".mp3", ".flac")
-            if os.path.exists(alt_p): p = alt_p
-            else: raise FileNotFoundError(f"Missing asset: {p}")
-
-    return ([s1_path, s2_path], [s1_text, s2_text])
+            if os.path.exists(alt_p):
+                refined_paths.append(alt_p)
+            else:
+                raise FileNotFoundError(f"Missing asset: {p}")
+    return (refined_paths, [s1_text, s2_text])
 
 # ==================== 核心处理逻辑 ====================
 
@@ -103,7 +115,6 @@ async def run_tts_process(episode_id: str):
     tts_model = get_tts_model()
     r2_client = get_r2_client()
 
-    # 1. 获取任务数据
     response = supabase.table('episodes').select('*').eq('id', episode_id).execute()
     if not response.data:
         raise ValueError(f"Episode {episode_id} not found")
@@ -112,14 +123,11 @@ async def run_tts_process(episode_id: str):
     language = episode.get('language')
     script_content = episode.get('script_content', {})
     
-    # 2. 更新状态
     supabase.table('episodes').update({'status': 'tts_processing'}).eq('id', episode_id).execute()
 
-    # 3. 准备文本
     dialogue = script_content.get('dialogue', [])
     text_list = [f"{'[S1]' if d.get('role') == 'Host' else '[S2]'}{d.get('text')}" for d in dialogue]
 
-    # 4. 推理
     prompt_wavs, prompt_texts = get_cloning_refs(language)
     rec_wavs = tts_model.generate_dialogue(
         text_list=text_list,
@@ -128,7 +136,6 @@ async def run_tts_process(episode_id: str):
         temperature=0.7, topk=20
     )
 
-    # 5. 保存并上传
     sample_rate = 24000
     tmp_path = f"/tmp/{episode_id}.wav"
     torchaudio.save(tmp_path, rec_wavs.detach().cpu(), sample_rate)
@@ -143,7 +150,6 @@ async def run_tts_process(episode_id: str):
     
     audio_url = f"{R2_PUBLIC_URL.rstrip('/')}/{r2_key}"
 
-    # 6. 完成回写
     supabase.table('episodes').update({
         'audio_url': audio_url,
         'duration': int(duration_seconds),
@@ -156,9 +162,6 @@ async def run_tts_process(episode_id: str):
 # ==================== RunPod Handler ====================
 
 def handler(job):
-    """
-    RunPod Serverless 入口函数
-    """
     try:
         job_input = job["input"]
         episode_id = job_input.get("episode_id")
@@ -166,7 +169,6 @@ def handler(job):
         if not episode_id:
             return {"error": "Missing episode_id"}
 
-        # 运行异步处理逻辑
         loop = asyncio.get_event_loop()
         result = loop.run_until_complete(run_tts_process(episode_id))
         
@@ -178,5 +180,4 @@ def handler(job):
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
-    # 启动 RunPod Worker
     runpod.serverless.start({"handler": handler})
