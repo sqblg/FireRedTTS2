@@ -216,7 +216,7 @@ def run_tts_process(episode_id: str):
     prompt_wavs, prompt_texts = get_cloning_refs(language)
     
     try:
-        BATCH_SIZE = 10
+        BATCH_SIZE = 2
         audio_segments = []
         with torch.inference_mode():
             for i in range(0, len(text_list), BATCH_SIZE):
