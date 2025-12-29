@@ -12,6 +12,7 @@ import boto3
 from botocore.client import Config
 from supabase import create_client
 from huggingface_hub import snapshot_download  # 🔵 [新增] 核心下载工具
+import gc
 
 # ==================== 环境变量 ====================
 # 请在 RunPod 控制台的 Environment Variables 中设置这些值
@@ -170,8 +171,15 @@ def get_cloning_refs(language_iso: str):
 
 def run_tts_process(episode_id: str):
     """
-    同步执行 TTS 任务
+    同步执行 TTS 任务 (分批推理 + 显存保护版)
     """
+    print(f"🔄 Processing Episode ID: {episode_id}")
+    
+    # 🟢 [新增] 强制显存清理 (任务开始前)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     supabase = get_supabase_client()
     tts_model = get_tts_model()
     r2_client = get_r2_client()
@@ -183,59 +191,120 @@ def run_tts_process(episode_id: str):
     
     episode = response.data[0]
     language = episode.get('language')
+    if not language: raise ValueError("Language field is missing")
+
     script_content = episode.get('script_content', {})
     
     # 2. 更新状态为 'tts_processing'
     print(f"   ⏳ Updating status to 'tts_processing'...")
     supabase.table('episodes').update({'status': 'tts_processing'}).eq('id', episode_id).execute()
 
-    # 3. 准备文本
-    dialogue = script_content.get('dialogue', [])
-    text_list = [f"[{'S1' if d.get('role') == 'Host' else 'S2'}]{d.get('text')}" for d in dialogue]
+    # 3. 准备文本 (保持原有清洗逻辑)
+    raw_dialogue = script_content.get('dialogue', [])
+    text_list = []
+    
+    for i, d in enumerate(raw_dialogue):
+        role = d.get('role', 'Guest')
+        content = d.get('text', '')
+        if content:
+            content = content.strip()
+            content = content.replace('[', '【').replace(']', '】')
+        if not content: continue
+        tag = '[S1]' if role == 'Host' else '[S2]'
+        text_list.append(f"{tag}{content}")
 
-    # 4. 推理
+    if not text_list:
+        raise ValueError("Script dialogue is empty after cleaning")
+        
+    print(f"   📝 Prepared {len(text_list)} lines. Preview: {text_list[:2]}...")
+
+    # 4. 🟢 [重构] 分批推理 (Batch Inference)
     print(f"   🎙️ Generating audio for {episode_id}...")
     prompt_wavs, prompt_texts = get_cloning_refs(language)
-    rec_wavs = tts_model.generate_dialogue(
-        text_list=text_list,
-        prompt_wav_list=prompt_wavs,
-        prompt_text_list=prompt_texts,
-        temperature=0.7,
-        topk=20
-    )
+    
+    try:
+        BATCH_SIZE = 10  # 每次处理 10 句
+        audio_segments = []
+        
+        # 使用 inference_mode 进一步节省显存
+        with torch.inference_mode():
+            for i in range(0, len(text_list), BATCH_SIZE):
+                batch_texts = text_list[i : i + BATCH_SIZE]
+                print(f"      Processing Batch {i//BATCH_SIZE + 1}/{(len(text_list)+BATCH_SIZE-1)//BATCH_SIZE}...")
+                
+                # 推理当前批次
+                wav_batch = tts_model.generate_dialogue(
+                    text_list=batch_texts,
+                    prompt_wav_list=prompt_wavs,
+                    prompt_text_list=prompt_texts,
+                    temperature=0.7,
+                    topk=20
+                )
+                
+                # 收集结果 (注意维度处理)
+                if isinstance(wav_batch, list):
+                    # 如果模型返回列表，拼接成 Tensor
+                    wav_batch = torch.cat(wav_batch, dim=1) if len(wav_batch) > 0 else torch.tensor([])
+                
+                # 确保是 CPU Tensor，防止占用显存
+                audio_segments.append(wav_batch.cpu())
+                
+                # 🟢 [关键] 每批次后清理显存
+                del wav_batch
+                torch.cuda.empty_cache()
+        
+        # 拼接所有批次
+        if not audio_segments:
+            raise ValueError("No audio generated")
+            
+        print("      Merging audio segments...")
+        final_wav = torch.cat(audio_segments, dim=1)
+
+    except AssertionError as ae:
+        print(f"   🔴 Model Assertion Error! Input text format might be wrong.")
+        print(f"   🔴 Debug Text List: {json.dumps(text_list, ensure_ascii=False)}")
+        raise ae
+    except Exception as e:
+        torch.cuda.empty_cache()
+        raise e
 
     # 5. 保存并上传 R2
     sample_rate = 24000
     tmp_path = f"/tmp/{episode_id}.wav"
-    torchaudio.save(tmp_path, rec_wavs.detach().cpu(), sample_rate)
-    duration_seconds = rec_wavs.shape[-1] // sample_rate
+    torchaudio.save(tmp_path, final_wav, sample_rate)
+    duration_seconds = final_wav.shape[-1] // sample_rate
 
     r2_key = f"podcasts/{episode_id}.wav"
+    print(f"   ☁️ Uploading to R2: {r2_key}")
     with open(tmp_path, 'rb') as f:
         r2_client.put_object(
-            Bucket=R2_BUCKET_NAME, Key=r2_key, Body=f,
+            Bucket=os.environ.get("R2_BUCKET_NAME"), 
+            Key=r2_key, 
+            Body=f, 
             ContentType='audio/wav'
         )
     
-    audio_url = f"{R2_PUBLIC_URL.rstrip('/')}/{r2_key}"
+    audio_url = f"{os.environ.get('R2_PUBLIC_URL').rstrip('/')}/{r2_key}"
 
     # 6. 完成回写
-    print(f"   ✅ RAG Upload complete. Updating DB status to 'completed'...")
+    print(f"   ✅ Done. Updating DB status to 'completed'...")
     supabase.table('episodes').update({
         'audio_url': audio_url,
         'duration': int(duration_seconds),
         'status': 'completed',
         'tts_updated_at': datetime.utcnow().isoformat(),
-        'retry_count': 0  # 重置重试计数
+        'retry_count': 0
     }).eq('id', episode_id).execute()
     
     # 清理
     if os.path.exists(tmp_path): os.remove(tmp_path)
-    # 显存清理
+    # 🟢 [新增] 强制显存清理 (任务结束后)
+    del final_wav
+    del audio_segments
+    gc.collect()
     torch.cuda.empty_cache()
 
     return {"audio_url": audio_url}
-
 # ==================== RunPod Handler ====================
 
 def handler(job):
