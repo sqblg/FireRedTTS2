@@ -284,7 +284,8 @@ def run_tts_process(episode_id: str):
             ContentType='audio/wav'
         )
     
-    audio_url = f"{os.environ.get('R2_PUBLIC_URL').rstrip('/')}/{r2_key}"
+    # ✅ 直接使用全局变量 R2_PUBLIC_URL (它已经在文件头部处理过默认值和rstrip了)
+    audio_url = f"{R2_PUBLIC_URL}/{r2_key}"
 
     # 6. 完成回写
     print(f"   ✅ Done. Updating DB status to 'completed'...")
