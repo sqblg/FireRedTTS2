@@ -39,6 +39,8 @@ RUN pip install --no-deps -e .
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1
+# 🔴 [新增] 解决 PyTorch 显存碎片化问题
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
 
 # 🔴 关键配置：指定模型在网络卷中的位置
 ENV MODEL_DIR=/runpod-volume/FireRedTTS2
